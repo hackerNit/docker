@@ -5,22 +5,77 @@ version: 2.1
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/2.0/configuration-reference/#docker-machine-macos-windows-executor
-    docker:
-      - image: cimg/base:stable
-    # Add steps to the job
-    # See: https://circleci.com/docs/2.0/configuration-reference/#steps
+    Build-Push-Image-Docker:
+    description: Build and push image to Google Container Registry
+    machine: true
     steps:
       - checkout
+      - gcr/gcr-auth
       - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
+          name: Build Docker Image
+          command: |
+            docker build -t asia.gcr.io/$GOOGLE_PROJECT_ID/baas-consumer:<< pipeline.number >> .
+      - run:
+          name: Push image to GCR
+          command: |
+            docker push asia.gcr.io/$GOOGLE_PROJECT_ID/baas-consumer:<< pipeline.number >>
 
-# Invoke jobs via workflows
-# See: https://circleci.com/docs/2.0/configuration-reference/#workflows
+  Deploy-to-GKE:
+    description: Deploy application to Google Kubernetes Engine
+    machine: true
+    steps:
+      # Install `gcloud` and `kubectl` if not already installed.
+      - gcp-gke/install
+      # Initialize the `gcloud` CLI.
+      - gcp-gke/update-kubeconfig-with-credentials:
+          cluster: $GOOGLE_CLUSTER_ID
+          perform-login: true
+
+      - add_ssh_keys:
+          fingerprints:
+            - $GOOGLE_SSH_KEY
+
+      # Update a deployment Docker image.
+      - run:
+          name: Set Image
+          command: |
+            kubectl set env deployment/baas-consumer \\
+            PYTHONUNBUFFERED='true' \\
+            DATABASE_URL=$DATABASE_URL \\
+            GCP_PROJECT_ID=$GCP_PROJECT_ID \\
+            GCP_SQL_INSTANCE_ID=$GCP_SQL_INSTANCE_ID \\
+            REMOTE_DB_HOST=$REMOTE_DB_HOST \\
+            DOCKER_IMAGE_NAME=$DOCKER_IMAGE_NAME \\
+            RABBITMQ_CONNECTION_URL=$RABBITMQ_CONNECTION_URL \\
+            QUEUE_NAME=$QUEUE_NAME \\
+            CLIENT_REDIS_URL=$CLIENT_REDIS_URL \\
+            GITLAB_HOST=$GITLAB_HOST \\
+            GITLAB_PRIVATE_TOKEN=$GITLAB_PRIVATE_TOKEN \\
+            BAAS_GITLAB_NAMESPACE_ID=$BAAS_GITLAB_NAMESPACE_ID \\
+            BAAS_BOILERPLATE_URL=$BAAS_BOILERPLATE_URL \\
+            GITLAB_USERNAME=$GITLAB_USERNAME \\
+            GITLAB_PASSWORD=$GITLAB_PASSWORD \\
+            -n viasocket && kubectl set image deployment/baas-consumer baas-consumer=asia.gcr.io/$GOOGLE_PROJECT_ID/baas-consumer:<< pipeline.number >> -n viasocket
+
 workflows:
-  say-hello-workflow:
+  Build_Deploy_Dev:
     jobs:
-      - say-hello
+      - Build-Push-Image-Docker:
+          filters:
+            branches:
+              only:
+                - master
+          context:
+            - gke-dev
+            - baas-consumer-dev
+
+      - Deploy-to-GKE:
+          requires:
+            - Build-Push-Image-Docker
+          filters:
+            branches:
+              only:
+                - master
+          context:
+            - gke-dev
+            - baas-consumer-dev
